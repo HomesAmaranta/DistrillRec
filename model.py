@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
 from peft import LoraConfig, TaskType, get_peft_model
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM,AutoConfig
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
-
+from torch.cuda.amp import GradScaler, autocast
+import numpy as np
 
 class RecSys(nn.Module):
     def __init__(self, **args):
@@ -17,8 +18,10 @@ class RecSys(nn.Module):
         peft_config = LoraConfig(task_type='FEATURE_EXTRACTION', target_modules=[
                                  "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"], r=16, lora_alpha=16, lora_dropout=0.05)
 
+        config = AutoConfig.from_pretrained(self.args['base_model'], output_hidden_states=True)
         # model和tokenizer设置
         model = AutoModelForCausalLM.from_pretrained(self.base_model,
+                                                     config=config,
                                                      load_in_8bit=True,
                                                      torch_dtype=torch.float16,
                                                      local_files_only=True,
@@ -41,31 +44,74 @@ class RecSys(nn.Module):
         self.response_ids, self.response_mask = self.tokenizer(response,
                                                                truncation=True, padding=False, return_tensors='pt', add_special_tokens=False).values()
 
+        self.embed_tokens = self.model.get_input_embeddings()
         # 嵌入层的设置
         self.item_embed = nn.Embedding.from_pretrained(
             self.args["item_embed"], freeze=True)  # 将SASRec的嵌入层权重加载进来，并冻结
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.item_embed.to(self.device)
+        
         self.item_proj = nn.Linear(
             self.input_dim, self.model.config.hidden_size)  # 不确定是否可以得到config
+        self.item_proj.to(self.device)
+        
         self.score = nn.Linear(
             self.model.config.hidden_size, self.output_dim, bias=False)
+        self.score.to(self.device)
+        
 
     def predict(self, inputs, inputs_mask):
         bs = inputs.shape[0]
-        instruct_embeds = self.model.model.embed_tokens(self.instruct_ids.cuda()).expand(bs, -1, -1)
-        response_embeds = self.model.model.embed_tokens(
+        # instruct_embeds = self.model.model.embed_tokens(self.instruct_ids.cuda()).expand(bs, -1, -1)
+        instruct_embeds = self.embed_tokens(
+            self.instruct_ids.cuda()).expand(bs, -1, -1)
+        # response_embeds = self.model.model.embed_tokens(self.response_ids.cuda()).expand(bs, -1, -1)
+        response_embeds = self.embed_tokens(
             self.response_ids.cuda()).expand(bs, -1, -1)
         instruct_mask = self.instruct_mask.cuda().expand(bs, -1)
         response_mask = self.response_mask.cuda().expand(bs, -1)
+        
+        # print(self.device)
+        # print(inputs.device)
+        # print(next(self.item_proj.parameters()).device)
 
         inputs = self.item_proj(self.item_embed(inputs))
+        print("inputs:",inputs)
+        print("instruct_embeds:",instruct_embeds)
+        print("response_embeds:",response_embeds)
         inputs = torch.cat([instruct_embeds, inputs, response_embeds], dim=1)
         attention_mask = torch.cat(
             [instruct_mask, inputs_mask, response_mask], dim=1)
         # assert attention_mask.size()[0] == inputs.size()[0] and attention_mask.size()[1] == inputs.size()[1]
+        print("attention_mask.size()[0]:",attention_mask.size()[0])
+        print("inputs.size()[0]:",inputs.size()[0])
+        print("attention_mask.size()[1]:",attention_mask.size()[1])
+        print("inputs.size()[1]:",inputs.size()[1])
+        
+        print("inputs has nan:",torch.isnan(inputs).any())
+        # 判断张量中各个元素是否等于0
+        contains_zero = torch.eq(inputs, 0)  # 返回布尔张量
 
-        outputs = self.model(inputs_embeds=inputs,
+        # 判断是否存在0
+        exists_zero = torch.any(contains_zero)  # 返回布尔值
+        print("exists_zero",exists_zero)
+
+        # print("inputs.dtype:",inputs.dtype)
+        # print("attention_mask.dtype:",attention_mask.dtype)
+        # print("inputs.float().dtype:",inputs.float().dtype)
+        with autocast():  # 使用自动混合精度
+            outputs = self.model(inputs_embeds=inputs,
                              attention_mask=attention_mask, return_dict=True)
-        pooled_output = outputs.last_hidden_state[:, -1]
+        
+        print("outputs.hidden_states:",dir(outputs))
+        # hs=torch.tensor(outputs.hidden_states)
+        # print("outputs.hidden_states.shape:",dir(outputs.hidden_states))
+        pooled_output = outputs.hidden_states[-1]
+        # print("pooled_output",pooled_output)
+        print("pooled_output.shape",pooled_output.shape)
+        pooled_output = pooled_output[:,-1]
+        # print("pooled_output",pooled_output)
+        print("pooled_output.shape",pooled_output.shape)
         pooled_logits = self.score(pooled_output)
 
         return outputs, pooled_logits.view(-1, self.output_dim)

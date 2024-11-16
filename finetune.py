@@ -7,6 +7,8 @@ from transformers import AdamW, get_scheduler
 from torch import nn
 from tqdm.auto import tqdm
 import pickle
+import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -35,26 +37,36 @@ def collate_fn_val(batch_samples):
     return inputs, inputs_mask, labels
 
 
-def train_loop(dataloader, model, loss_fn, optimizer, lr_scheduler, epoch, total_loss):
+def train_loop(dataloader, model, loss_fn, optimizer, lr_scheduler, epoch, total_loss,scaler):
     progress_bar = tqdm(range(len(dataloader)))
     progress_bar.set_description(f'loss: {0:>7f}')
     finish_step_num = (epoch-1)*len(dataloader)
 
     model.train()
     for step, (inputs, inputs_mask, labels) in enumerate(dataloader, start=1):
-        inputs, inputs_mask,labels = inputs.to(device), inputs_mask.to(device), labels.to(device)
-        pred = model(inputs, inputs_mask)
-        loss = loss_fn(pred, labels)
-
+        inputs, inputs_mask, labels = inputs.to(
+            device), inputs_mask.to(device), labels.to(device)
+        # 清零梯度
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        lr_scheduler.step()
+        with autocast():
+            pred = model(inputs, inputs_mask)
+            loss = loss_fn(pred, labels)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        # optimizer.zero_grad()
+        # loss.backward()
+        # optimizer.step()
+        # lr_scheduler.step()
+        # 更新学习率
 
         total_loss += loss.item()
         progress_bar.set_description(
             f'loss: {total_loss/(finish_step_num + step):>7f}')
         progress_bar.update(1)
+        
+    lr_scheduler.step()
+    
     return total_loss
 
 
@@ -66,7 +78,7 @@ def test_loop(dataloader, model, mode='Test'):
     model.eval()
     with torch.no_grad():
         for inputs, inputs_mask, labels in dataloader:
-            inputs, inputs_mask = inputs.to(
+            inputs, inputs_mask, lables = inputs.to(
                 device), inputs_mask.to(device), labels.to(device)
             pred = model(inputs, inputs_mask)
             correct += (pred.argmax(1) ==
@@ -84,17 +96,18 @@ def run(base_model: str = "Qwen/Qwen2.5-1.5B-Instruct",
         epoch_num: int = 1,
         learning_rate: float = 3e-4,
         maxlen: int = 200,
-        item_embed_hidden_units: int = 50):
+        item_embed_hidden_units: int = 50,
+        batch_size:int=8):
     dataset = SeqDataset("./"+data+"_processed.txt", maxlen)
-    item_embed=pickle.load(open("./"+data+"_SASRec_item_embed.pkl", 'rb'))
+    item_embed = pickle.load(open("./embedding/"+data+"_SASRec_item_embed.pkl", 'rb'))
     model = RecSys(output_dim=dataset.item_max,
                    input_dim=item_embed_hidden_units,
                    base_model=base_model,
                    item_embed=item_embed)
     train_dataloader = DataLoader(
-        dataset.train_data, batch_size=64, shuffle=True, collate_fn=collate_fn)
+        dataset.train_data, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     valid_dataloader = DataLoader(
-        dataset.val_data, batch_size=64, shuffle=True, collate_fn=collate_fn)
+        dataset.val_data, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
     optimizer = AdamW(model.parameters(), lr=learning_rate)
     loss_fn = nn.CrossEntropyLoss()
@@ -105,11 +118,13 @@ def run(base_model: str = "Qwen/Qwen2.5-1.5B-Instruct",
         num_warmup_steps=warmup_steps,
         num_training_steps=epoch_num*len(train_dataloader),
     )
-    total_loss=0
+    # 创建梯度缩放器
+    scaler = GradScaler()
+    total_loss = 0
     for t in range(epoch_num):
         print(f"Epoch {t+1}/{epoch_num}\n-------------------------------")
         total_loss = train_loop(
-            train_dataloader, model, loss_fn, optimizer, lr_scheduler, t+1, total_loss)
+            train_dataloader, model, loss_fn, optimizer, lr_scheduler, t+1, total_loss,scaler)
         test_loop(valid_dataloader, model, mode='Valid')
     print("Done!")
     torch.save(model.state_dict(), "model.bin")
