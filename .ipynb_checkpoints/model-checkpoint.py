@@ -20,20 +20,21 @@ class RecSys(nn.Module):
 
         config = AutoConfig.from_pretrained(self.args['base_model'], output_hidden_states=True)
         # model和tokenizer设置
-        model = AutoModelForCausalLM.from_pretrained(self.base_model,
+        print("model name:",self.base_model)
+        self.model = AutoModelForCausalLM.from_pretrained(self.base_model,
                                                      config=config,
-                                                     load_in_8bit=True,
-                                                     torch_dtype=torch.float16,
+                                                     # load_in_8bit=True,
+                                                     # torch_dtype=torch.float16,
                                                      local_files_only=True,
                                                      cache_dir='/root/autodl-tmp/')
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model,
-                                                       load_in_8bit=True,
-                                                       torch_dtype=torch.float16,
+                                                       # load_in_8bit=True,
+                                                       # torch_dtype=torch.float16,
                                                        local_files_only=True,
                                                        cache_dir='/root/autodl-tmp/')
-
+        print("model:",self.model)
         # 加载lora配置
-        self.model = get_peft_model(model, peft_config)
+        self.model = get_peft_model(self.model, peft_config)
 
         # 得到输入的id和mask
         instruct = "Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\n\n### Instruction:\nGiven the user’s purchase history, predict next possible item to be purchased.\n\n### Input:\n"
@@ -107,7 +108,7 @@ class RecSys(nn.Module):
         # hs=torch.tensor(outputs.hidden_states)
         # print("outputs.hidden_states.shape:",dir(outputs.hidden_states))
         pooled_output = outputs.hidden_states[-1]
-        # print("pooled_output",pooled_output)
+        print("pooled_output",pooled_output)
         print("pooled_output.shape",pooled_output.shape)
         pooled_output = pooled_output[:,-1]
         # print("pooled_output",pooled_output)
@@ -115,9 +116,31 @@ class RecSys(nn.Module):
         pooled_logits = self.score(pooled_output)
 
         return outputs, pooled_logits.view(-1, self.output_dim)
+    
+    def predict2(self, inputs, inputs_mask):
+        inputs=["你好","有什么可以帮助你的吗","中午吃什么","你喜欢我吗"]
+        X = self.tokenizer(inputs,padding=True,truncation=True,return_tensors="pt")
+        print("X:\n",X)
+        
+       
+        with autocast():  # 使用自动混合精度
+            outputs = self.model.generate(**X)
+        print("outputs:",outputs)
+        for i in range(outputs.shape[0]):
+            generated_text = self.tokenizer.decode(outputs[i], skip_special_tokens=True)
+            print("generated_text:",generated_text)
+        # print("outputs.hidden_states:",outputs.hidden_states)
+        # pooled_output = outputs.hidden_states[-1]
+        # print("pooled_output",pooled_output)
+        # pooled_output = pooled_output[:,-1]
+        # # print("pooled_output",pooled_output)
+        # print("pooled_output.shape",pooled_output.shape)
+        # pooled_logits = self.score(pooled_output)
+
+        return outputs, pooled_logits.view(-1, self.output_dim)
 
     def forward(self, inputs, inputs_mask):
-        outputs, pooled_logits = self.predict(inputs, inputs_mask)
+        outputs, pooled_logits = self.predict2(inputs, inputs_mask)
 
         # loss = None
         # if labels is not None:
